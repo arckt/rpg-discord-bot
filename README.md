@@ -74,7 +74,7 @@ This repository contains the code for an RPG Discord bot that manages a Call of 
 
 - **Admin User ID**: Set the `ADMIN_USER_ID` variable in the code to your Discord user ID to restrict certain commands to admins only.
 - **Bot Token**: Set `BOT_TOKEN` variable in the code the discord bot token.
-- **Rulebooks**: Add a `books` directory with the relevant .txt files for lore.
+- **Rulebooks**: Add a `books` directory with the relevant .txt files for lore, then run embedder.py to make the information retrievable.
 - **Character Sheets**: Players need to attach their character sheets in a format that suits the group's preferences.
 
 ## Contributing
