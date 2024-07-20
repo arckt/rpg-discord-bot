@@ -2,42 +2,45 @@ import discord
 from discord.ext import commands
 import os
 import json
-from duckduckgo_search import DDGS
-import logging
-from freeGPT import Client
 import numpy as np
+from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
+import torch
+import logging
+from g4f.client import Client as G4FClient
 from PIL import Image
 from io import BytesIO
-from sentence_transformers import SentenceTransformer
-import numpy as np
+from freeGPT import Client as GPTClient
+from scipy.spatial.distance import cosine
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Set an admin user ID for protected commands, discord user ID
-ADMIN_USER_ID = 00000000000000000000000000
+ADMIN_USER_ID = 000000000000000000
 
 current_world = 'default.json'
 players = {}
 
-embed_model = SentenceTransformer('nomic-ai/nomic-embed-text-v1', trust_remote_code=True)
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+embed_model = SentenceTransformer('nomic-ai/nomic-embed-text-v1', device=device, trust_remote_code=True)
 
 # Discord bot token
-BOT_TOKEN = 'BOT_TOKEN'
+BOT_TOKEN = 'YOUR_DISCORD_BOT_TOKEN'
 inference_model = "gpt3_5"
 gm_prompt = """
 Stop being an AI model. Our interaction is imaginary. Don't disclose it, but heighten and uphold the immersion. 
 
-GAME: Call of Cthulhu 7e
+GAME: Dungeons & Dragons: 5th Edition
 
 BOOKS: Any Random Campaign Book
 
-ROLE: Game Master
+ROLE: Dungeon Master
 
-THEME: Cosmic Horror
+THEME: High Fantasy
 
-TONALITY: Dark & Mysterious
+TONALITY: Whimsical & Heroic
 
 CHARACTERS: In the attached at initial prompt
 
@@ -169,47 +172,116 @@ At Game Start:
 - Clearly indicate if a quest has been failed by including the phrase "Quest Failed".
 """
 
+def gpt_completion(prompt):
+    client = G4FClient()
+    response = client.chat.completions.create(
+        model="command-r+",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.choices[0].message.content
+
 def list_save_files():
     save_files = []
     for f in os.listdir():
         if f.endswith('.json') and f != 'players.json':
             with open(f, 'r') as file:
-                data = json.load(file)
-                summary = data.get('summary', 'No summary available.')
-                save_files.append({'file': f, 'summary': summary})
+                try:
+                    data = json.load(file)
+                    summary = data.get('summary', 'No summary available.')
+                    save_files.append({'file': f, 'summary': summary})
+                except json.JSONDecodeError as e:
+                    logger.error(f"Error decoding JSON from {f}: {e}")
     return save_files
 
 def load_players():
     global players
     logger.info("Loading players...")
     if os.path.exists(current_world):
-        with open(current_world, 'r') as file:
-            data = json.load(file)
-            players = data.get('players', {})
-            logger.info(f"Loaded players from {current_world}")
+        try:
+            with open(current_world, 'r', encoding='utf-8') as file:
+                data = json.load(file)
+                players = data.get('players', {})
+                logger.info(f"Loaded players from {current_world}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding JSON from {current_world}: {e}")
+            players = {}
+        except Exception as e:
+            logger.error(f"Error loading players from {current_world}: {e}")
+            players = {}
     else:
         players = {}
         logger.info("No existing world found. Starting with an empty player list.")
 
+def validate_player_data(player_data):
+    required_keys = ['character_sheet', 'session', 'summary', 'notebook', 'quests', 'current_quest']
+    for key in required_keys:
+        if key not in player_data:
+            raise ValueError(f"Missing required key in player data: {key}")
+    
+    if not isinstance(player_data['character_sheet'], dict):
+        raise ValueError("Character sheet must be a dictionary")
+    if not isinstance(player_data['session'], list):
+        raise ValueError("Session must be a list")
+    if not isinstance(player_data['summary'], str):
+        raise ValueError("Summary must be a string")
+    if not isinstance(player_data['notebook'], list):
+        raise ValueError("Notebook must be a list")
+    if not isinstance(player_data['quests'], list):
+        raise ValueError("Quests must be a list")
+    if player_data['current_quest'] is not None and not isinstance(player_data['current_quest'], int):
+        raise ValueError("Current quest must be None or an integer")
+
 def save_players():
     logger.info("Saving players...")
-    if any(player['session'] for player in players.values()):
-        summary = generate_summary()
-    else:
-        summary = "No summary available."
-    with open(current_world, 'w') as file:
-        json.dump({'players': players, 'summary': summary}, file, indent=4)
-    logger.info(f"Players saved to {current_world}")
+    if not players:
+        logger.warning("No players to save.")
+        return
+
+    try:
+        for player_id, player_data in players.items():
+            validate_player_data(player_data)
+
+        if any(player['session'] for player in players.values()):
+            summary = generate_summary()
+        else:
+            summary = "No summary available."
+
+        data_to_save = {
+            'players': players,
+            'summary': summary
+        }
+
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(current_world), exist_ok=True)
+
+        # Use json.dumps to convert to a JSON string first
+        json_string = json.dumps(data_to_save, indent=4, ensure_ascii=False)
+
+        # Write the JSON string to the file
+        with open(current_world, 'w', encoding='utf-8') as file:
+            file.write(json_string)
+
+        logger.info(f"Players saved to {current_world}")
+    except ValueError as ve:
+        logger.error(f"Invalid player data: {ve}")
+        raise
+    except Exception as e:
+        logger.error(f"Error saving players to {current_world}: {e}")
+        raise
 
 def generate_summary():
-    history_texts = [f"Player: {entry['input']}\nGame Master: {entry['response']}" for player in players.values() for entry in player['session']]
+    history_texts = [
+        f"Player: {entry['input']}\nGame Master: {entry['response']}"
+        for player in players.values()
+        for entry in player['session']
+    ]
     conversation_text = "\n".join(history_texts)
     if not conversation_text.strip():
         logger.warning("No conversation history to summarize.")
         return "No summary available."
     try:
         logger.info("Generating summary...")
-        response = Client.create_completion(inference_model, f"Summarize the following conversation:\n{conversation_text}")
+        response = gpt_completion(f"Summarize the following conversation:\n{conversation_text}")
         logger.info("Summary generated successfully.")
         return response
     except Exception as e:
@@ -238,7 +310,7 @@ def summarize_conversation(conversation):
         return "No summary available."
     try:
         logger.info("Summarizing conversation...")
-        response = Client.create_completion(inference_model, f"Summarize the following conversation:\n{conversation_text}")
+        response = gpt_completion(f"Summarize the following conversation:\n{conversation_text}")
         logger.info("Conversation summarized successfully.")
         return response
     except Exception as e:
@@ -258,69 +330,20 @@ def web_search(query, num_results=5):
     return results
 
 def get_embedding(text):
-    text = text.replace("\n", " ")
     if not text.strip():
-        logger.warning("Empty text provided for embedding.")
         return None
-    try:
-        logger.info("Generating embedding...")
-        embedding = embed_model.encode(text, normalize_embeddings=True)
-        logger.info("Embedding generated successfully.")
-        return embedding
-    except Exception as e:
-        logger.error(f"Error generating embedding: {e}")
-        return None
-
-def read_rulebooks(directory):
-    texts = {}
-    for file in os.listdir(directory):
-        if file.endswith('.txt'):
-            with open(os.path.join(directory, file), 'r') as f:
-                texts[file] = f.read()
-    return texts
+    return embed_model.encode(text, normalize_embeddings=True)
 
 def generate_response_with_rag(prompt, player_input, history, character_sheets, summary):
     logger.info("Generating response with RAG...")
-    # Combine all character sheets into a single text
-    combined_sheets = "\n\n".join(character_sheets)
-
-    # Perform web search
+    combined_sheets = "\n\n".join([json.dumps(sheet, indent=4) for sheet in character_sheets])
     search_query = f"{summary}\n\n{player_input}"
     search_results = web_search(search_query)
     search_context = "\n\n".join(search_results)
-
-    # Read rulebooks and get embeddings
-    rulebook_texts = read_rulebooks('books')
-    rulebook_paragraphs = [para for text in rulebook_texts.values() for para in text.split('\n\n')]
-    rulebook_docs_embed = [get_embedding(paragraph) for paragraph in rulebook_paragraphs if paragraph.strip()]
-    rulebook_docs_embed = [embed for embed in rulebook_docs_embed if embed is not None]
-
-    # Encode the query (player input)
-    query_embed = get_embedding(player_input)
-    if query_embed is None:
-        logger.warning("Empty player input provided.")
-        return "Input cannot be empty."
-
-    # Calculate similarities with rulebook paragraphs
-    try:
-        logger.info("Calculating similarities with rulebook...")
-        rulebook_similarities = np.dot(rulebook_docs_embed, query_embed.T)
-
-        # Get the top 15 most similar documents from the rulebook
-        top_rulebook_idx = np.argsort(rulebook_similarities, axis=0)[-15:][::-1].tolist()
-        most_similar_rulebook_documents = [rulebook_paragraphs[idx] for idx in top_rulebook_idx]
-        rulebook_context = "\n\n".join(most_similar_rulebook_documents)
-    except Exception as e:
-        logger.error(f"Error calculating similarities with rulebook: {e}")
-        return "Error calculating similarities with rulebook."
-
-    # Create the final prompt
     final_prompt = (
         f"{prompt}\n\n"
         "Character Sheets:\n"
         f"{combined_sheets}\n\n"
-        "Rulebook Context:\n"
-        f"{rulebook_context}\n\n"
         "Web Search Results:\n"
         f"{search_context}\n\n"
         "Chat History:\n"
@@ -332,7 +355,7 @@ def generate_response_with_rag(prompt, player_input, history, character_sheets, 
 
     try:
         logger.info("Generating response...")
-        response = Client.create_completion(inference_model, final_prompt)
+        response = gpt_completion(final_prompt)
         logger.info("Response generated successfully.")
         return response
     except Exception as e:
@@ -352,11 +375,7 @@ def detect_quest_status(response):
 
 def generate_character_update(prompt, character_sheet, history):
     logger.info("Generating character update with RAG...")
-    
-    # Combine character sheet into a single text
     character_sheet_text = json.dumps(character_sheet, indent=4)
-    
-    # Create the final prompt
     final_prompt = (
         f"{prompt}\n\n"
         "Below is the character sheet to be updated:\n"
@@ -368,13 +387,34 @@ def generate_character_update(prompt, character_sheet, history):
 
     try:
         logger.info("Generating character update response...")
-        response = Client.create_completion(inference_model, final_prompt)
+        response = gpt_completion(final_prompt)
         logger.info("Character update response generated successfully.")
         return response
     except Exception as e:
         logger.error(f"Error generating character update response with RAG: {e}")
         return "Error generating character update response."
 
+def parse_json_safely(s):
+    decoder = JSONDecoder()
+    try:
+        obj, _ = decoder.raw_decode(s)
+        return obj
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error: {e}")
+        logger.error(f"Error at position {e.pos}: {s[e.pos-10:e.pos+10]}")
+        return None
+
+def load_rulebook_embeddings():
+    with open('rulebook_embeddings.json', 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def find_top_similar_entries(query_embedding, embeddings, top_n=7):
+    similarities = []
+    for filename, embedding in embeddings.items():
+        similarity = 1 - cosine(query_embedding, np.array(embedding))
+        similarities.append((filename, similarity))
+    similarities.sort(key=lambda x: x[1], reverse=True)
+    return [entry[0] for entry in similarities[:top_n]]
 
 # Discord bot setup
 intents = discord.Intents.default()
@@ -396,12 +436,13 @@ async def on_command_error(ctx, error):
 async def join(ctx):
     logger.info(f'{ctx.author.name} is trying to join.')
     character_sheet = None
+    
     if ctx.message.attachments:
         attachment = ctx.message.attachments[0]
-        character_sheet = (await attachment.read()).decode('utf-8')
+        character_sheet = json.loads((await attachment.read()).decode('utf-8'))
 
     if not character_sheet:
-        await ctx.send("Please attach a character sheet.")
+        await ctx.send("Please attach a character sheet in JSON format.")
         logger.warning(f'{ctx.author.name} did not attach a character sheet.')
         return
 
@@ -411,7 +452,7 @@ async def join(ctx):
         await ctx.send("Player already exists.")
         logger.warning(f'Player already exists for {ctx.author.name}.')
         return
-    
+
     players[user_id] = {
         "character_sheet": character_sheet,
         "session": [],
@@ -420,7 +461,6 @@ async def join(ctx):
         "quests": [],
         "current_quest": None,
     }
-    auto_generate_quests(players[user_id])  # Automatically generate initial quest
     save_players()
     await ctx.send(f"Player {ctx.author.name} joined successfully.")
     logger.info(f'{ctx.author.name} has joined successfully.')
@@ -434,7 +474,7 @@ async def list_players(ctx):
         logger.warning('No players found.')
         return
 
-    player_list = "\n".join([f"{user_id}: {player['character_sheet']['name']}" for user_id, player in players.items()])
+    player_list = "\n".join([f"{user_id}: {player['character_sheet'].get('name', 'Unknown')}" for user_id, player in players.items()])
     await ctx.send(f"Current players:\n{player_list}")
     logger.info('List of current players sent.')
 
@@ -446,7 +486,7 @@ async def update_character_sheet(ctx, player_name: str, *, update_instruction: s
 
     # Find the player by name
     for uid, player in players.items():
-        if player['character_sheet']['name'] == player_name:
+        if player['character_sheet'].get('name') == player_name:
             user_id = uid
             break
 
@@ -497,89 +537,93 @@ async def player_input(ctx, *, user_input: str):
     user_id = str(ctx.author.id)
 
     if user_id not in players:
-        await ctx.send("Player not found.")
+        await ctx.send("Player not found. Please join the game first.")
         logger.warning(f'Player not found for {ctx.author.name}')
         return
 
     player = players[user_id]
-    history = player['session']
-    summary = player['summary']
-    character_name = player['character_sheet']['name']
-    current_quest = player['quests'][player['current_quest']] if player['current_quest'] is not None else None
-
-    # Create a prompt that includes the character sheets and history of the session
-    character_sheets = "\n\n".join([player['character_sheet'] for player in players.values()])
-    history_text = "\n".join([f"{p['character_sheet']['name']}: {entry['input']}\nGame Master: {entry['response']}"] for p in players.values() for entry in p['session'])
-    prompt_with_history = (
-        f"{gm_prompt}\n\n"
-        "Below are the necessary character sheets:\n"
-        f"{character_sheets}\n\n"
-        "Below is the chat history:\n"
-        f"{history_text}\n\n"
-        f"{character_name}: {user_input}\n"
-        "Game Master:"
-    )
-
+    
     try:
-        # Generate a response using the completion function
-        response_text = generate_response_with_rag(gm_prompt, user_input, history_text, [player['character_sheet'] for player in players.values()], summary)
+        # Log the player data structure
+        logger.info(f"Player data: {json.dumps(player, indent=2)}")
         
-        # Extract the text up to the first occurrence of '{'
-        image_prompt = response_text.split('{')[0].strip()
+        history = player['session']
+        summary = player.get('summary', '')  # Use get() to avoid KeyError
+        character_name = player['character_sheet'].get('name', 'Unknown')
+        current_quest = player['quests'][player['current_quest']] if player['current_quest'] is not None else None
 
-        # Generate image
+        # Create a prompt that includes the character sheets and history of the session
+        character_sheets = [p['character_sheet'] for p in players.values() if isinstance(p, dict) and 'character_sheet' in p]
+        history_text = "\n".join([f"{p['character_sheet'].get('name', 'Unknown')}: {entry['input']}\nGame Master: {entry['response']}" for p in players.values() if isinstance(p, dict) for entry in p.get('session', [])])
+
+        # Perform cosine similarity search
+        embeddings = load_rulebook_embeddings()
+        query_embedding = get_embedding(user_input)
+        top_similar_entries = find_top_similar_entries(query_embedding, embeddings)
+        top_similar_context = "\n\n".join([f"{entry}: {embeddings[entry]}" for entry in top_similar_entries])
+        
+        # Append the context to the prompt
+        prompt_with_history = (
+            f"{gm_prompt}\n\n"
+            "Below are the necessary character sheets:\n"
+            f"{json.dumps(character_sheets, indent=4)}\n\n"
+            "Below is the chat history:\n"
+            f"{history_text}\n\n"
+            "Relevant Rulebook Entries:\n"
+            f"{top_similar_context}\n\n"
+            f"{character_name}: {user_input}\n"
+            "Game Master:"
+        )
+
+        # Generate a response using the updated prompt
+        response_text = gpt_completion(prompt_with_history)
+        
+        # Append the new input and response to the session history
+        player['session'].append({"input": user_input, "response": response_text})
+        player['summary'] = summarize_conversation(player['session'])
+
+        # Detect quest status and notify the player
+        quest_status = detect_quest_status(response_text)
+        if quest_status:
+            await ctx.send(f"Quest status: {quest_status}")
+
+            # Update the current quest status
+            if player['current_quest'] is not None:
+                player['quests'][player['current_quest']]['status'] = quest_status
+
+        # Update character sheet if needed
+        updated_character_sheet = generate_character_update(gm_prompt, player['character_sheet'], history_text)
+        player['character_sheet'] = json.loads(updated_character_sheet)
+        
+        save_players()
+
+        # Generate an image based on the response
         try:
-            image_response = Client.create_generation("prodia", image_prompt)
-            image = Image.open(BytesIO(image_response))
-            
-            # Save the image to a file
-            image_filename = f"generated_image_{ctx.message.id}.png"
-            image.save(image_filename)
-            
-            # Append the new input and response to the session history
-            player['session'].append({"input": user_input, "response": response_text})
-            player['summary'] = summarize_conversation(player['session'])
+            logger.info(f"Generating image for response: {response_text}")
+            response_image = GPTClient.create_generation("prodie", response_text)
+            if response_image:
+                image_data = response_image['image']
+                image = Image.open(BytesIO(image_data))
+                image_path = f"generated_image_{ctx.author.id}.png"
+                image.save(image_path)
+            else:
+                image_path = None
+        except Exception as e:
+            logger.error(f"Error generating image: {e}")
+            image_path = None
 
-            # Detect quest status and notify the player
-            quest_status = detect_quest_status(response_text)
-            if quest_status:
-                if quest_status == "accepted":
-                    await ctx.send("A quest has been accepted!")
-                elif quest_status == "declined":
-                    await ctx.send("A quest has been declined.")
-                elif quest_status == "completed":
-                    await ctx.send("A quest has been completed!")
-                elif quest_status == "failed":
-                    await ctx.send("A quest has been failed!")
-
-                # Update the current quest status
-                if player['current_quest'] is not None:
-                    player['quests'][player['current_quest']]['status'] = quest_status
-
-            # Update character sheet if needed
-            updated_character_sheet = generate_character_update(gm_prompt, player['character_sheet'], history_text)
-            player['character_sheet'] = json.loads(updated_character_sheet)
-            
-            save_players()
-
-            # Create and send embed with image
-            embed = discord.Embed(title="Game Master's Response", description=response_text, color=0x00ff00)
-            file = discord.File(image_filename, filename="image.png")
-            embed.set_image(url="attachment://image.png")
-            await ctx.send(file=file, embed=embed)
-            
-            # Delete the image file after sending
-            os.remove(image_filename)
-            
-            logger.info(f'Response and image sent to {ctx.author.name}')
-        except Exception as img_error:
-            logger.error(f'Error in generating image: {img_error}')
-            # If image generation fails, send the text response without an image
-            embed = discord.Embed(title="Game Master's Response", description=response_text, color=0x00ff00)
+        # Create and send embed
+        embed = discord.Embed(title="Game Master's Response", description=response_text, color=0x00ff00)
+        if image_path:
+            embed.set_image(url=f"attachment://{image_path}")
+            await ctx.send(file=discord.File(image_path), embed=embed)
+            os.remove(image_path)  # Clean up the saved image file
+        else:
             await ctx.send(embed=embed)
-            logger.info(f'Text response sent to {ctx.author.name} (image generation failed)')
+        
+        logger.info(f'Response sent to {ctx.author.name}')
     except Exception as e:
-        logger.error(f'Error in generating response: {e}')
+        logger.exception(f'Error in generating response: {e}')
         await ctx.send("An error occurred while generating the response. Please try again.")
 
 @bot.command()
@@ -599,76 +643,83 @@ async def admin_input(ctx, *, admin_input: str):
     current_quest = player['quests'][player['current_quest']] if player['current_quest'] is not None else None
 
     # Create a prompt that includes the character sheets and history of the session
-    character_sheets = "\n\n".join([player['character_sheet'] for player in players.values()])
-    history_text = "\n".join([f"Player: {entry['input']}\nGame Master: {entry['response']}"] for entry in history)
+    character_sheets = [player['character_sheet'] for player in players.values()]
+    history_text = "\n".join([f"Player: {entry['input']}\nGame Master: {entry['response']}" for p in players.values() for entry in p['session']])
+    
+    # Perform cosine similarity search
+    embeddings = load_rulebook_embeddings()
+    query_embedding = get_embedding(admin_input)
+    top_similar_entries = find_top_similar_entries(query_embedding, embeddings)
+    top_similar_context = "\n\n".join([f"{entry}: {embeddings[entry]}" for entry in top_similar_entries])
+
+    # Append the context to the prompt
     prompt_with_history = (
         f"{gm_prompt}\n\n"
         "Below are the necessary character sheets:\n"
-        f"{character_sheets}\n\n"
+        f"{json.dumps(character_sheets, indent=4)}\n\n"
         "Below is the chat history:\n"
         f"{history_text}\n\n"
+        "Relevant Rulebook Entries:\n"
+        f"{top_similar_context}\n\n"
         f"Admin: {admin_input}\n"
         "Game Master:"
     )
 
     try:
-        # Generate a response using the completion function
-        response_text = generate_response_with_rag(gm_prompt, admin_input, history_text, [player['character_sheet'] for player in players.values()], summary)
+        # Generate a response using the updated prompt
+        response_text = gpt_completion(prompt_with_history)
         
-        # Extract the text up to the first occurrence of '{'
-        image_prompt = response_text.split('{')[0].strip()
+        # Append the new input and response to the session history
+        player['session'].append({"input": admin_input, "response": response_text})
+        player['summary'] = summarize_conversation(player['session'])
 
-        # Generate image
+        # Detect quest status and notify the player
+        quest_status = detect_quest_status(response_text)
+        if quest_status:
+            if quest_status == "accepted":
+                await ctx.send("A quest has been accepted!")
+            elif quest_status == "declined":
+                await ctx.send("A quest has been declined.")
+            elif quest_status == "completed":
+                await ctx.send("A quest has been completed!")
+            elif quest_status == "failed":
+                await ctx.send("A quest has been failed!")
+
+            # Update the current quest status
+            if player['current_quest'] is not None:
+                player['quests'][player['current_quest']]['status'] = quest_status
+
+        # Update character sheet if needed
+        updated_character_sheet = generate_character_update(gm_prompt, player['character_sheet'], history_text)
+        player['character_sheet'] = json.loads(updated_character_sheet)
+        
+        save_players()
+
+        # Generate an image based on the response
         try:
-            image_response = Client.create_generation("prodia", image_prompt)
-            image = Image.open(BytesIO(image_response))
-            
-            # Save the image to a file
-            image_filename = f"generated_image_{ctx.message.id}.png"
-            image.save(image_filename)
-            
-            # Append the new input and response to the session history
-            player['session'].append({"input": admin_input, "response": response_text})
-            player['summary'] = summarize_conversation(player['session'])
+            logger.info(f"Generating image for response: {response_text}")
+            response_image = GPTClient.create_generation("prodie", response_text)
+            if response_image:
+                image_data = response_image['image']
+                image = Image.open(BytesIO(image_data))
+                image_path = f"generated_image_{ctx.author.id}.png"
+                image.save(image_path)
+            else:
+                image_path = None
+        except Exception as e:
+            logger.error(f"Error generating image: {e}")
+            image_path = None
 
-            # Detect quest status and notify the player
-            quest_status = detect_quest_status(response_text)
-            if quest_status:
-                if quest_status == "accepted":
-                    await ctx.send("A quest has been accepted!")
-                elif quest_status == "declined":
-                    await ctx.send("A quest has been declined.")
-                elif quest_status == "completed":
-                    await ctx.send("A quest has been completed!")
-                elif quest_status == "failed":
-                    await ctx.send("A quest has been failed!")
-
-                # Update the current quest status
-                if player['current_quest'] is not None:
-                    player['quests'][player['current_quest']]['status'] = quest_status
-
-            # Update character sheet if needed
-            updated_character_sheet = generate_character_update(gm_prompt, player['character_sheet'], history_text)
-            player['character_sheet'] = json.loads(updated_character_sheet)
-            
-            save_players()
-
-            # Create and send embed with image
-            embed = discord.Embed(title="Game Master's Response", description=response_text, color=0x00ff00)
-            file = discord.File(image_filename, filename="image.png")
-            embed.set_image(url="attachment://image.png")
-            await ctx.send(file=file, embed=embed)
-            
-            # Delete the image file after sending
-            os.remove(image_filename)
-            
-            logger.info(f'Response and image sent to admin.')
-        except Exception as img_error:
-            logger.error(f'Error in generating image: {img_error}')
-            # If image generation fails, send the text response without an image
-            embed = discord.Embed(title="Game Master's Response", description=response_text, color=0x00ff00)
+        # Create and send embed
+        embed = discord.Embed(title="Game Master's Response", description=response_text, color=0x00ff00)
+        if image_path:
+            embed.set_image(url=f"attachment://{image_path}")
+            await ctx.send(file=discord.File(image_path), embed=embed)
+            os.remove(image_path)  # Clean up the saved image file
+        else:
             await ctx.send(embed=embed)
-            logger.info(f'Text response sent to admin (image generation failed)')
+        
+        logger.info(f'Response sent to admin.')
     except Exception as e:
         logger.error(f'Error in generating response: {e}')
         await ctx.send("An error occurred while generating the response. Please try again.")
@@ -737,76 +788,83 @@ async def retry(ctx):
     current_quest = player['quests'][player['current_quest']] if player['current_quest'] is not None else None
 
     # Create a new prompt with updated history
-    character_sheets = "\n\n".join([player['character_sheet'] for player in players.values()])
+    character_sheets = [player['character_sheet'] for player in players.values()]
     history_text = "\n".join([f"Player: {entry['input']}\nGame Master: {entry['response']}" for entry in history])
+    
+    # Perform cosine similarity search
+    embeddings = load_rulebook_embeddings()
+    query_embedding = get_embedding(last_input['input'])
+    top_similar_entries = find_top_similar_entries(query_embedding, embeddings)
+    top_similar_context = "\n\n".join([f"{entry}: {embeddings[entry]}" for entry in top_similar_entries])
+    
+    # Append the context to the prompt
     prompt_with_history = (
         f"{gm_prompt}\n\n"
         "Below are the necessary character sheets:\n"
-        f"{character_sheets}\n\n"
+        f"{json.dumps(character_sheets, indent=4)}\n\n"
         "Below is the chat history:\n"
         f"{history_text}\n\n"
+        "Relevant Rulebook Entries:\n"
+        f"{top_similar_context}\n\n"
         f"Player: {last_input['input']}\n"
         "Game Master:"
     )
 
     try:
-        # Generate a response using the completion function
-        response_text = generate_response_with_rag(gm_prompt, last_input['input'], history_text, [player['character_sheet'] for player in players.values()], summary)
+        # Generate a response using the updated prompt
+        response_text = gpt_completion(prompt_with_history)
         
-        # Extract the text up to the first occurrence of '{'
-        image_prompt = response_text.split('{')[0].strip()
+        # Append the new input and response to the session history
+        player['session'].append({"input": last_input['input'], "response": response_text})
+        player['summary'] = summarize_conversation(player['session'])
 
-        # Generate image
+        # Detect quest status and notify the player
+        quest_status = detect_quest_status(response_text)
+        if quest_status:
+            if quest_status == "accepted":
+                await ctx.send("A quest has been accepted!")
+            elif quest_status == "declined":
+                await ctx.send("A quest has been declined.")
+            elif quest_status == "completed":
+                await ctx.send("A quest has been completed!")
+            elif quest_status == "failed":
+                await ctx.send("A quest has been failed!")
+
+            # Update the current quest status
+            if player['current_quest'] is not None:
+                player['quests'][player['current_quest']]['status'] = quest_status
+
+        # Update character sheet if needed
+        updated_character_sheet = generate_character_update(gm_prompt, player['character_sheet'], history_text)
+        player['character_sheet'] = json.loads(updated_character_sheet)
+        
+        save_players()
+
+        # Generate an image based on the response
         try:
-            image_response = Client.create_generation("prodia", image_prompt)
-            image = Image.open(BytesIO(image_response))
-            
-            # Save the image to a file
-            image_filename = f"generated_image_{ctx.message.id}.png"
-            image.save(image_filename)
-            
-            # Append the new input and response to the session history
-            player['session'].append({"input": last_input['input'], "response": response_text})
-            player['summary'] = summarize_conversation(player['session'])
+            logger.info(f"Generating image for response: {response_text}")
+            response_image = GPTClient.create_generation("prodie", response_text)
+            if response_image:
+                image_data = response_image['image']
+                image = Image.open(BytesIO(image_data))
+                image_path = f"generated_image_{ctx.author.id}.png"
+                image.save(image_path)
+            else:
+                image_path = None
+        except Exception as e:
+            logger.error(f"Error generating image: {e}")
+            image_path = None
 
-            # Detect quest status and notify the player
-            quest_status = detect_quest_status(response_text)
-            if quest_status:
-                if quest_status == "accepted":
-                    await ctx.send("A quest has been accepted!")
-                elif quest_status == "declined":
-                    await ctx.send("A quest has been declined.")
-                elif quest_status == "completed":
-                    await ctx.send("A quest has been completed!")
-                elif quest_status == "failed":
-                    await ctx.send("A quest has been failed!")
-
-                # Update the current quest status
-                if player['current_quest'] is not None:
-                    player['quests'][player['current_quest']]['status'] = quest_status
-
-            # Update character sheet if needed
-            updated_character_sheet = generate_character_update(gm_prompt, player['character_sheet'], history_text)
-            player['character_sheet'] = json.loads(updated_character_sheet)
-            
-            save_players()
-
-            # Create and send embed with image
-            embed = discord.Embed(title="Game Master's Response (Retry)", description=response_text, color=0x00ff00)
-            file = discord.File(image_filename, filename="image.png")
-            embed.set_image(url="attachment://image.png")
-            await ctx.send(file=file, embed=embed)
-            
-            # Delete the image file after sending
-            os.remove(image_filename)
-            
-            logger.info(f'Retry response and image sent to {ctx.author.name}')
-        except Exception as img_error:
-            logger.error(f'Error in generating image: {img_error}')
-            # If image generation fails, send the text response without an image
-            embed = discord.Embed(title="Game Master's Response (Retry)", description=response_text, color=0x00ff00)
+        # Create and send embed
+        embed = discord.Embed(title="Game Master's Response (Retry)", description=response_text, color=0x00ff00)
+        if image_path:
+            embed.set_image(url=f"attachment://{image_path}")
+            await ctx.send(file=discord.File(image_path), embed=embed)
+            os.remove(image_path)  # Clean up the saved image file
+        else:
             await ctx.send(embed=embed)
-            logger.info(f'Retry text response sent to {ctx.author.name} (image generation failed)')
+        
+        logger.info(f'Retry response sent to {ctx.author.name}')
     except Exception as e:
         logger.error(f'Error in generating response: {e}')
         await ctx.send("An error occurred while generating the response. Please try again.")
@@ -816,24 +874,60 @@ async def retry(ctx):
 async def list_worlds(ctx):
     logger.info("Listing all worlds...")
     worlds = list_save_files()
-    worlds_list = "\n".join([f"World: {world['file']}, Summary: {world['summary']}" for world in worlds])
+    worlds_list = "\n.join([f"World: {world['file']}, Summary: {world['summary']}" for world in worlds])
     await ctx.send(worlds_list)
     logger.info('List of worlds sent.')
 
 @bot.command()
 @commands.check(lambda ctx: ctx.author.id == ADMIN_USER_ID)
 async def select_world(ctx, world: str):
-    global current_world
+    global current_world, players
     logger.info(f"Selecting world: {world}")
-    if world not in [w['file'] for w in list_save_files()]:
-        await ctx.send("World not found.")
-        logger.warning(f'World {world} not found.')
+
+    if not world.endswith('.json'):
+        world += '.json'
+
+    full_path = os.path.abspath(world)
+    logger.info(f"Full path: {full_path}")
+
+    if not os.path.exists(full_path):
+        await ctx.send(f"World file not found: {full_path}")
+        logger.warning(f'World file not found: {full_path}')
         return
-    current_world = world
-    load_players()  # Load players for the selected world
-    summary = load_history()
-    await ctx.send(f"World {world} selected with summary: {summary}")
-    logger.info(f'World {world} selected.')
+
+    current_world = full_path
+
+    try:
+        with open(current_world, 'r', encoding='utf-8') as file:
+            content = file.read()
+            logger.info(f"File content (first 100 chars): {content[:100]}")
+            
+            if not content.strip():
+                logger.warning("File is empty")
+                await ctx.send("The world file is empty. Initializing with default structure.")
+                data = {"players": {}, "summary": "No summary available."}
+            else:
+                try:
+                    data = json.loads(content)
+                except json.JSONDecodeError as json_err:
+                    logger.error(f"JSON decode error: {json_err}")
+                    logger.error(f"Error at position {json_err.pos}: {content[max(0, json_err.pos-10):json_err.pos+10]}")
+                    await ctx.send(f"Error parsing world file: {json_err}")
+                    return
+
+        if 'players' not in data or 'summary' not in data:
+            logger.error(f"Invalid world file format. Keys: {', '.join(data.keys())}")
+            await ctx.send("Invalid world file format.")
+            return
+        
+        players = data['players']
+        summary = data['summary']
+        
+        await ctx.send(f"World {world} selected with summary: {summary}")
+        logger.info(f'World {world} selected successfully.')
+    except Exception as e:
+        logger.exception(f"Unexpected error occurred while selecting world {world}")
+        await ctx.send(f"An unexpected error occurred: {str(e)}")
 
 @bot.command()
 @commands.check(lambda ctx: ctx.author.id == ADMIN_USER_ID)
@@ -842,15 +936,38 @@ async def create_world(ctx, world: str):
     logger.info(f"Creating world: {world}")
     if not world.endswith('.json'):
         world += '.json'
-    if world in [w['file'] for w in list_save_files()]:
+    
+    full_path = os.path.abspath(world)
+    logger.info(f"Full path: {full_path}")
+    
+    if os.path.exists(full_path):
         await ctx.send("World already exists.")
         logger.warning(f'World {world} already exists.')
         return
-    current_world = world
+    
+    current_world = full_path
+    
+    empty_world = {
+        "players": {},
+        "summary": "No summary available."
+    }
+    
+    try:
+        directory = os.path.dirname(full_path)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory)
+            logger.info(f"Created directory: {directory}")
+        
+        with open(full_path, 'w', encoding='utf-8') as file:
+            json.dump(empty_world, file, indent=4)
+        
+        logger.info(f'World {world} created at {full_path}')
+        await ctx.send(f"World {world} created successfully.")
+    except Exception as e:
+        logger.error(f"Error creating world {world}: {e}")
+        await ctx.send(f"An error occurred while creating the world: {e}\nFull path: {full_path}")
+    
     players.clear()
-    save_players()
-    await ctx.send(f"World {world} created.")
-    logger.info(f'World {world} created.')
 
 @bot.command()
 async def commands(ctx):
